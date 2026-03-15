@@ -1,0 +1,17 @@
+name = "status-page"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+
+# Health checks every 3 minutes
+[triggers]
+crons = ["*/3 * * * *"]
+
+# R2 bucket binding
+[[r2_buckets]]
+binding = "STATUS_BUCKET"
+bucket_name = "status-page-data"
+
+# Custom domain
+# routes = [
+#   { pattern = "status.luischav.es", custom_domain = true }
+# ]

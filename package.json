@@ -1,0 +1,11 @@
+{
+  "name": "status-page",
+  "version": "0.1.0",
+  "description": "Downtime detector and status page for luischav.es services",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  }
+}
