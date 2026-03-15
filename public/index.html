@@ -487,7 +487,7 @@
           }
         }
 
-        const responseText = svc.isUp ? `${svc.responseTimeMs}ms` : `HTTP ${svc.statusCode || 'timeout'}`;
+        const responseText = svc.isUp ? `Response: ${svc.responseTimeMs}ms` : `Error: HTTP ${svc.statusCode || 'timeout'}`;
 
         html += `
           <div class="service-card">
@@ -663,10 +663,66 @@
       }
     }
 
-    fetchStatus();
-    fetchUptime();
-    fetchIncidents();
-    setInterval(fetchStatus, 3 * 60 * 1000);
+    // === MOCK DATA (remove once backend is deployed) ===
+    function generateMockData() {
+      const now = new Date();
+
+      // Mock latest status
+      statusData = {
+        updated: now.toISOString(),
+        services: [
+          { id: 'etymology', name: 'Etymology Explorer', url: 'https://etymology.luischav.es', statusCode: 200, responseTimeMs: 342, isUp: true },
+          { id: 'tfl', name: 'TfL Status', url: 'https://tfl.luischav.es', statusCode: 200, responseTimeMs: 128, isUp: true },
+        ],
+      };
+
+      // Mock uptime data (90 days)
+      const lines = statusData.services.map(svc => {
+        const days = [];
+        for (let i = 0; i < 90; i++) {
+          const d = new Date(now);
+          d.setUTCDate(d.getUTCDate() - 89 + i);
+          const date = d.toISOString().split('T')[0];
+          // Mostly 100%, occasional dips
+          let uptimePct = 100;
+          if (Math.random() < 0.08) uptimePct = 95 + Math.random() * 5;
+          if (Math.random() < 0.03) uptimePct = 80 + Math.random() * 15;
+          if (svc.id === 'etymology' && i === 87) uptimePct = 0; // Simulate the outage 2 days ago
+          days.push({ date, uptimePct: Math.round(uptimePct * 100) / 100, avgResponseMs: Math.round(100 + Math.random() * 400), incidents: [] });
+        }
+        const validDays = days.filter(d => d.uptimePct !== null);
+        const overallUptime = validDays.reduce((sum, d) => sum + d.uptimePct, 0) / validDays.length;
+        return { id: svc.id, name: svc.name, url: svc.url, overallUptime: Math.round(overallUptime * 100) / 100, days };
+      });
+      uptimeData = lines;
+
+      // Mock incidents
+      const twoDaysAgo = new Date(now);
+      twoDaysAgo.setUTCDate(twoDaysAgo.getUTCDate() - 2);
+      const incidentDate = twoDaysAgo.toISOString().split('T')[0];
+      allIncidentsByDate = {};
+      allIncidentsByDate[incidentDate] = [
+        { serviceId: 'etymology', serviceName: 'Etymology Explorer', statusCode: 503, firstSeen: twoDaysAgo.toISOString() },
+      ];
+      sortedIncidentDates = Object.keys(allIncidentsByDate).sort((a, b) => b.localeCompare(a));
+
+      // Render everything
+      document.getElementById('updated').textContent = `Updated ${formatRelativeTime(statusData.updated)}`;
+      renderStatusBanner(statusData.services);
+      renderServices();
+      visibleDayCount = 7;
+      renderIncidentDays();
+    }
+
+    // Use mock data for local preview (API_BASE contains __API_BASE__ placeholder)
+    if (API_BASE.includes('__API_BASE__')) {
+      generateMockData();
+    } else {
+      fetchStatus();
+      fetchUptime();
+      fetchIncidents();
+      setInterval(fetchStatus, 3 * 60 * 1000);
+    }
   </script>
 </body>
 </html>
