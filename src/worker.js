@@ -136,6 +136,7 @@ async function appendToCsv(env, checks) {
   const date = new Date(checks[0].timestamp);
   const monthKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
   const csvKey = `data/${monthKey}.csv`;
+  const header = 'timestamp,service_id,status_code,response_time_ms,is_up\n';
 
   let existingCsv = '';
   try {
@@ -144,11 +145,19 @@ async function appendToCsv(env, checks) {
       existingCsv = await existing.text();
     }
   } catch (e) {
-    // File doesn't exist yet
+    console.error(`Failed to read existing CSV ${csvKey}:`, e.message);
+    // Fall through — we'll start fresh rather than lose the new data
+  }
+
+  // Validate existing CSV has the expected header; if corrupted, start fresh
+  // but preserve any salvageable rows
+  if (existingCsv && !existingCsv.startsWith('timestamp,')) {
+    console.error(`CSV ${csvKey} appears corrupted (bad header), starting fresh`);
+    existingCsv = '';
   }
 
   if (!existingCsv) {
-    existingCsv = 'timestamp,service_id,status_code,response_time_ms,is_up\n';
+    existingCsv = header;
   }
 
   const newRows = checks
@@ -192,10 +201,21 @@ async function updateDailyAggregate(env, checks) {
   try {
     const existing = await env.STATUS_BUCKET.get(key);
     if (existing) {
-      aggregate = await existing.json();
+      const parsed = await existing.json();
+      // Validate the parsed aggregate has expected shape
+      if (parsed && typeof parsed === 'object' && parsed.date) {
+        aggregate = parsed;
+        // Ensure services object exists even if file was partially written
+        if (!aggregate.services || typeof aggregate.services !== 'object') {
+          aggregate.services = {};
+        }
+        if (typeof aggregate.samples !== 'number') {
+          aggregate.samples = 0;
+        }
+      }
     }
   } catch (e) {
-    console.log(`Creating new aggregate for ${today}`);
+    console.error(`Failed to read/parse aggregate for ${today}, starting fresh:`, e.message);
   }
 
   for (const check of checks) {
@@ -345,10 +365,13 @@ async function updateAlertState(env, checks) {
   try {
     const existing = await env.STATUS_BUCKET.get('alert-state.json');
     if (existing) {
-      alertState = await existing.json();
+      const parsed = await existing.json();
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        alertState = parsed;
+      }
     }
   } catch (e) {
-    // Fresh start
+    console.error('Failed to read/parse alert-state.json, starting fresh:', e.message);
   }
 
   let stateChanged = false;
@@ -403,37 +426,54 @@ export default {
   async scheduled(event, env, ctx) {
     console.log('Status check starting...');
 
+    let checks;
     try {
-      const { timestamp, checks } = await checkAllServices();
-
-      // Store results
-      await appendToCsv(env, checks);
-      await updateLatestJson(env, checks);
-      await updateDailyAggregate(env, checks);
-
-      // Background: pre-compute JSON, update alert state, cleanup old aggregates
-      const oldDate = new Date();
-      oldDate.setUTCDate(oldDate.getUTCDate() - 91);
-      const oldAggregateKey = `aggregates/${oldDate.toISOString().split('T')[0]}.json`;
-
-      ctx.waitUntil(Promise.all([
-        updateUptimeJson(env)
-          .then(() => console.log('Updated uptime.json'))
-          .catch(e => console.error('Failed to update uptime.json:', e.message)),
-        updateIncidentsJson(env)
-          .then(() => console.log('Updated incidents.json'))
-          .catch(e => console.error('Failed to update incidents.json:', e.message)),
-        updateAlertState(env, checks)
-          .catch(e => console.error('Failed to update alert state:', e.message)),
-        env.STATUS_BUCKET.delete(oldAggregateKey).catch(() => {}),
-      ]));
-
-      const upCount = checks.filter(c => c.isUp).length;
-      console.log(`Status check complete. ${upCount}/${checks.length} services up.`);
+      const result = await checkAllServices();
+      checks = result.checks;
     } catch (e) {
-      console.error('Status check failed:', e);
-      throw e;
+      console.error('Health checks failed entirely:', e.message);
+      // Nothing to store — bail out but don't throw (cron stays healthy)
+      return;
     }
+
+    // Each storage step is independent — one failure must not block the others
+    try {
+      await appendToCsv(env, checks);
+    } catch (e) {
+      console.error('Failed to append CSV:', e.message);
+    }
+
+    try {
+      await updateLatestJson(env, checks);
+    } catch (e) {
+      console.error('Failed to update latest.json:', e.message);
+    }
+
+    try {
+      await updateDailyAggregate(env, checks);
+    } catch (e) {
+      console.error('Failed to update daily aggregate:', e.message);
+    }
+
+    // Background: pre-compute JSON, update alert state, cleanup old aggregates
+    const oldDate = new Date();
+    oldDate.setUTCDate(oldDate.getUTCDate() - 91);
+    const oldAggregateKey = `aggregates/${oldDate.toISOString().split('T')[0]}.json`;
+
+    ctx.waitUntil(Promise.all([
+      updateUptimeJson(env)
+        .then(() => console.log('Updated uptime.json'))
+        .catch(e => console.error('Failed to update uptime.json:', e.message)),
+      updateIncidentsJson(env)
+        .then(() => console.log('Updated incidents.json'))
+        .catch(e => console.error('Failed to update incidents.json:', e.message)),
+      updateAlertState(env, checks)
+        .catch(e => console.error('Failed to update alert state:', e.message)),
+      env.STATUS_BUCKET.delete(oldAggregateKey).catch(() => {}),
+    ]));
+
+    const upCount = checks.filter(c => c.isUp).length;
+    console.log(`Status check complete. ${upCount}/${checks.length} services up.`);
   },
 
   // HTTP handler - serve status data
@@ -459,17 +499,28 @@ export default {
 
     // Current status
     if (path === '/' || path === '/latest' || path === '/latest.json') {
-      const obj = await env.STATUS_BUCKET.get('latest.json');
-      if (!obj) {
-        return new Response('No data yet', { status: 404, headers: corsHeaders });
+      try {
+        const obj = await env.STATUS_BUCKET.get('latest.json');
+        if (!obj) {
+          return new Response(JSON.stringify({ error: 'No data yet' }), {
+            status: 404,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(obj.body, {
+          headers: {
+            ...corsHeaders,
+            'Content-Type': 'application/json',
+            'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
+          },
+        });
+      } catch (e) {
+        console.error('Error reading latest.json:', e.message);
+        return new Response(JSON.stringify({ error: 'Failed to read status data' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
       }
-      return new Response(obj.body, {
-        headers: {
-          ...corsHeaders,
-          'Content-Type': 'application/json',
-          'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
-        },
-      });
     }
 
     // Uptime data
@@ -477,15 +528,20 @@ export default {
       const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '90'), 1), 365);
 
       if (days === 90) {
-        const obj = await env.STATUS_BUCKET.get('uptime.json');
-        if (obj) {
-          return new Response(obj.body, {
-            headers: {
-              ...corsHeaders,
-              'Content-Type': 'application/json',
-              'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
-            },
-          });
+        try {
+          const obj = await env.STATUS_BUCKET.get('uptime.json');
+          if (obj) {
+            return new Response(obj.body, {
+              headers: {
+                ...corsHeaders,
+                'Content-Type': 'application/json',
+                'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
+              },
+            });
+          }
+        } catch (e) {
+          console.error('Error reading uptime.json:', e.message);
+          // Fall through to on-demand computation
         }
       }
 
@@ -575,17 +631,21 @@ export default {
     if (path === '/incidents') {
       const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '90'), 1), 365);
 
-      if (days === 90) {
-        const obj = await env.STATUS_BUCKET.get('incidents.json');
-        if (obj) {
-          return new Response(obj.body, {
-            headers: {
-              ...corsHeaders,
-              'Content-Type': 'application/json',
-              'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
-            },
-          });
+      try {
+        if (days === 90) {
+          const obj = await env.STATUS_BUCKET.get('incidents.json');
+          if (obj) {
+            return new Response(obj.body, {
+              headers: {
+                ...corsHeaders,
+                'Content-Type': 'application/json',
+                'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
+              },
+            });
+          }
         }
+      } catch (e) {
+        console.error('Error reading incidents.json:', e.message);
       }
 
       return new Response(JSON.stringify({ days, incidents: [] }), {
@@ -599,33 +659,55 @@ export default {
 
     // Historical CSV by month
     if (path.startsWith('/data/')) {
-      const key = path.slice(1);
-      const obj = await env.STATUS_BUCKET.get(key);
-      if (!obj) {
-        return new Response('Not found', { status: 404, headers: corsHeaders });
+      try {
+        const key = path.slice(1);
+        const obj = await env.STATUS_BUCKET.get(key);
+        if (!obj) {
+          return new Response(JSON.stringify({ error: 'Not found' }), {
+            status: 404,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(obj.body, {
+          headers: {
+            ...corsHeaders,
+            'Content-Type': 'text/csv',
+            'Cache-Control': 'public, max-age=3600, stale-while-revalidate=86400',
+          },
+        });
+      } catch (e) {
+        console.error('Error reading CSV data:', e.message);
+        return new Response(JSON.stringify({ error: 'Failed to read data' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
       }
-      return new Response(obj.body, {
-        headers: {
-          ...corsHeaders,
-          'Content-Type': 'text/csv',
-          'Cache-Control': 'public, max-age=3600, stale-while-revalidate=86400',
-        },
-      });
     }
 
     // List available months
     if (path === '/data') {
-      const list = await env.STATUS_BUCKET.list({ prefix: 'data/' });
-      const months = list.objects.map(o => o.key.replace('data/', '').replace('.csv', ''));
-      return new Response(JSON.stringify({ months }), {
-        headers: {
-          ...corsHeaders,
-          'Content-Type': 'application/json',
-          'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
-        },
-      });
+      try {
+        const list = await env.STATUS_BUCKET.list({ prefix: 'data/' });
+        const months = list.objects.map(o => o.key.replace('data/', '').replace('.csv', ''));
+        return new Response(JSON.stringify({ months }), {
+          headers: {
+            ...corsHeaders,
+            'Content-Type': 'application/json',
+            'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
+          },
+        });
+      } catch (e) {
+        console.error('Error listing data:', e.message);
+        return new Response(JSON.stringify({ error: 'Failed to list data' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
     }
 
-    return new Response('Not found', { status: 404, headers: corsHeaders });
+    return new Response(JSON.stringify({ error: 'Not found' }), {
+      status: 404,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
   },
 };
