@@ -99,11 +99,13 @@ async function checkService(service) {
       isUp,
     };
   } catch (e) {
+    const errorType = e.name === 'AbortError' ? 'timeout' : 'network';
     return {
       serviceId: service.id,
       statusCode: 0,
       responseTimeMs: Date.now() - start,
       isUp: false,
+      error: `${errorType}: ${e.message}`,
     };
   }
 }
@@ -136,7 +138,7 @@ async function appendToCsv(env, checks) {
   const date = new Date(checks[0].timestamp);
   const monthKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
   const csvKey = `data/${monthKey}.csv`;
-  const header = 'timestamp,service_id,status_code,response_time_ms,is_up\n';
+  const header = 'timestamp,service_id,status_code,response_time_ms,is_up,error\n';
 
   let existingCsv = '';
   try {
@@ -161,7 +163,7 @@ async function appendToCsv(env, checks) {
   }
 
   const newRows = checks
-    .map(c => `${c.timestamp},${c.serviceId},${c.statusCode},${c.responseTimeMs},${c.isUp}`)
+    .map(c => `${c.timestamp},${c.serviceId},${c.statusCode},${c.responseTimeMs},${c.isUp},${c.error || ''}`)
     .join('\n');
 
   await env.STATUS_BUCKET.put(csvKey, existingCsv + newRows + '\n', {
