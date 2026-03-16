@@ -715,8 +715,8 @@
       renderIncidentDays();
     }
 
-    // Use mock data for local preview (API_BASE contains __API_BASE__ placeholder)
-    if (API_BASE.includes('__API_BASE__')) {
+    // Use mock data for local preview only (when placeholder hasn't been replaced)
+    if (API_BASE === '__' + 'API_BASE' + '__') {
       generateMockData();
     } else {
       fetchStatus();
