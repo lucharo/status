@@ -23,7 +23,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Replace API_BASE placeholder
-        run: sed -i "s|__API_BASE__|${{ secrets.API_URL }}|g" public/index.html
+        run: |
+          if [ -z "${{ secrets.API_URL }}" ]; then
+            echo "::error::API_URL secret is not set"
+            exit 1
+          fi
+          sed -i "s|__API_BASE__|${{ secrets.API_URL }}|g" public/index.html
 
       - name: Deploy to Cloudflare Pages
         id: deploy

@@ -423,7 +423,7 @@ async function updateAlertState(env, checks) {
     }
   }
 
-  if (stateChanged || Object.keys(alertState).length !== Object.keys(alertState).length) {
+  if (stateChanged) {
     await env.STATUS_BUCKET.put('alert-state.json', JSON.stringify(alertState, null, 2), {
       httpMetadata: { contentType: 'application/json' },
     });
@@ -534,7 +534,7 @@ export default {
 
     // Uptime data
     if (path === '/uptime') {
-      const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '90'), 1), 365);
+      const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '90', 10) || 90, 1), 365);
 
       if (days === 90) {
         try {
@@ -638,7 +638,7 @@ export default {
 
     // Incidents data
     if (path === '/incidents') {
-      const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '90'), 1), 365);
+      const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '90', 10) || 90, 1), 365);
 
       try {
         if (days === 90) {
@@ -669,7 +669,14 @@ export default {
     // Historical CSV by month
     if (path.startsWith('/data/')) {
       try {
-        const key = path.slice(1);
+        const monthFile = path.slice(6); // after '/data/'
+        if (!/^\d{4}-\d{2}\.csv$/.test(monthFile)) {
+          return new Response(JSON.stringify({ error: 'Invalid data path' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        const key = `data/${monthFile}`;
         const obj = await env.STATUS_BUCKET.get(key);
         if (!obj) {
           return new Response(JSON.stringify({ error: 'Not found' }), {

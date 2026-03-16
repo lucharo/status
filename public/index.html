@@ -475,7 +475,8 @@
           barsHtml = uptime.days.map(day => {
             const barClass = getBarClass(day.uptimePct);
             return `<div class="uptime-bar ${barClass}"
-              onmouseenter="showTooltip(event, '${day.date}', ${day.uptimePct})"
+              data-date="${esc(day.date)}" data-uptime="${day.uptimePct}"
+              onmouseenter="showTooltip(event, this.dataset.date, this.dataset.uptime === 'null' ? null : parseFloat(this.dataset.uptime))"
               onmouseleave="hideTooltip()"></div>`;
           }).join('');
           if (uptime.overallUptime !== null) {
