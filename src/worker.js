@@ -2,7 +2,6 @@
 // Checks service health every 3 minutes, stores to R2, serves status API
 
 const SERVICES = [
-  // Main apps
   {
     id: 'etymology',
     name: 'Etymology Explorer',
@@ -22,28 +21,6 @@ const SERVICES = [
     name: 'TfL Status API',
     url: 'https://api-tfl.luischav.es',
     healthPath: '/latest.json',
-    timeoutMs: 10000,
-  },
-  {
-    id: 'testkitchen',
-    name: 'Test Kitchen',
-    url: 'https://testkitchen.luischav.es',
-    healthPath: '/',
-    timeoutMs: 10000,
-  },
-  // Content sites
-  {
-    id: 'dutch',
-    name: 'Dutch',
-    url: 'https://dutch.luischav.es',
-    healthPath: '/',
-    timeoutMs: 10000,
-  },
-  {
-    id: 'society',
-    name: 'Society',
-    url: 'https://society.luischav.es',
-    healthPath: '/',
     timeoutMs: 10000,
   },
 ];
