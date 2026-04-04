@@ -11,9 +11,11 @@ const SERVICES = [
     recovery: {
       kind: 'hf-space',
       spaceId: 'lucharo/etymology',
+      triggerStatusCodes: [503],
       triggerRuntimeStage: 'RUNTIME_ERROR',
       minConsecutiveFailures: 2,
       cooldownMs: 60 * 60 * 1000,
+      requestTimeoutMs: 10000,
     },
   },
   {
@@ -117,13 +119,31 @@ async function writeJsonObject(env, key, value) {
   });
 }
 
-async function getHfSpaceRuntime(spaceId, token) {
-  const response = await fetch(`${HF_API_BASE}/${spaceId}/runtime`, {
-    headers: {
-      'User-Agent': 'StatusPage/1.0',
-      Authorization: `Bearer ${token}`,
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function getHfSpaceRuntime(spaceId, token, timeoutMs) {
+  const response = await fetchWithTimeout(
+    `${HF_API_BASE}/${spaceId}/runtime`,
+    {
+      headers: {
+        'User-Agent': 'StatusPage/1.0',
+        Authorization: `Bearer ${token}`,
+      },
     },
-  });
+    timeoutMs
+  );
 
   if (!response.ok) {
     throw new Error(`HF runtime HTTP ${response.status}`);
@@ -132,14 +152,18 @@ async function getHfSpaceRuntime(spaceId, token) {
   return response.json();
 }
 
-async function restartHfSpace(spaceId, token) {
-  const response = await fetch(`${HF_API_BASE}/${spaceId}/restart`, {
-    method: 'POST',
-    headers: {
-      'User-Agent': 'StatusPage/1.0',
-      Authorization: `Bearer ${token}`,
+async function restartHfSpace(spaceId, token, timeoutMs) {
+  const response = await fetchWithTimeout(
+    `${HF_API_BASE}/${spaceId}/restart`,
+    {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'StatusPage/1.0',
+        Authorization: `Bearer ${token}`,
+      },
     },
-  });
+    timeoutMs
+  );
 
   if (!response.ok) {
     throw new Error(`HF restart HTTP ${response.status}`);
@@ -523,6 +547,7 @@ async function maybeRecoverServices(env, checks, alertState) {
 
     if (!recovery || recovery.kind !== 'hf-space' || !currentAlert) continue;
     if (currentAlert.isUp || currentAlert.consecutiveFailures < recovery.minConsecutiveFailures) continue;
+    if (recovery.triggerStatusCodes && !recovery.triggerStatusCodes.includes(check.statusCode)) continue;
 
     const prevRecoveryState =
       recoveryState[check.serviceId] &&
@@ -539,12 +564,12 @@ async function maybeRecoverServices(env, checks, alertState) {
 
     let runtime;
     try {
-      runtime = await getHfSpaceRuntime(recovery.spaceId, env.HF_TOKEN);
+      runtime = await getHfSpaceRuntime(recovery.spaceId, env.HF_TOKEN, recovery.requestTimeoutMs);
     } catch (e) {
       console.error(`[RECOVERY] Failed to read HF runtime for ${check.serviceId}:`, e.message);
       recoveryState[check.serviceId] = {
         ...prevRecoveryState,
-        lastAttemptAt: check.timestamp,
+        lastProbeFailureAt: check.timestamp,
         lastError: `runtime check failed: ${e.message}`,
       };
       shouldPersist = true;
@@ -559,7 +584,7 @@ async function maybeRecoverServices(env, checks, alertState) {
     }
 
     try {
-      const restarted = await restartHfSpace(recovery.spaceId, env.HF_TOKEN);
+      const restarted = await restartHfSpace(recovery.spaceId, env.HF_TOKEN, recovery.requestTimeoutMs);
       console.log(
         `[RECOVERY] Restarted ${recovery.spaceId} for ${check.serviceId}; ${runtime.stage} -> ${restarted.stage}`
       );
