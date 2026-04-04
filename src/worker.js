@@ -36,6 +36,8 @@ const SERVICES = [
 
 const HF_API_BASE = 'https://huggingface.co/api/spaces';
 const RECOVERY_STATE_KEY = 'recovery-state.json';
+const RECOVERY_EVENTS_KEY = 'recovery-events.json';
+const RECOVERY_EVENT_LIMIT = 25;
 
 // Parse CSV data into array of objects
 function parseCsv(csvText) {
@@ -116,6 +118,16 @@ async function readJsonObject(env, key, fallback = {}) {
 async function writeJsonObject(env, key, value) {
   await env.STATUS_BUCKET.put(key, JSON.stringify(value, null, 2), {
     httpMetadata: { contentType: 'application/json' },
+  });
+}
+
+async function appendRecoveryEvent(env, event) {
+  const existingLog = await readJsonObject(env, RECOVERY_EVENTS_KEY, { updated: null, events: [] });
+  const existingEvents = Array.isArray(existingLog.events) ? existingLog.events : [];
+
+  await writeJsonObject(env, RECOVERY_EVENTS_KEY, {
+    updated: event.timestamp,
+    events: [event, ...existingEvents].slice(0, RECOVERY_EVENT_LIMIT),
   });
 }
 
@@ -572,6 +584,14 @@ async function maybeRecoverServices(env, checks, alertState) {
         lastProbeFailureAt: check.timestamp,
         lastError: `runtime check failed: ${e.message}`,
       };
+      await appendRecoveryEvent(env, {
+        timestamp: check.timestamp,
+        serviceId: check.serviceId,
+        action: 'runtime_probe_failed',
+        statusCode: check.statusCode,
+        consecutiveFailures: currentAlert.consecutiveFailures,
+        error: e.message,
+      });
       shouldPersist = true;
       continue;
     }
@@ -594,6 +614,15 @@ async function maybeRecoverServices(env, checks, alertState) {
         lastRestartStage: restarted.stage,
         lastError: null,
       };
+      await appendRecoveryEvent(env, {
+        timestamp: check.timestamp,
+        serviceId: check.serviceId,
+        action: 'restart_succeeded',
+        statusCode: check.statusCode,
+        consecutiveFailures: currentAlert.consecutiveFailures,
+        runtimeStage: runtime.stage,
+        restartStage: restarted.stage,
+      });
     } catch (e) {
       console.error(`[RECOVERY] Failed to restart ${recovery.spaceId}:`, e.message);
       recoveryState[check.serviceId] = {
@@ -602,6 +631,15 @@ async function maybeRecoverServices(env, checks, alertState) {
         lastKnownRuntimeStage: runtime.stage,
         lastError: e.message,
       };
+      await appendRecoveryEvent(env, {
+        timestamp: check.timestamp,
+        serviceId: check.serviceId,
+        action: 'restart_failed',
+        statusCode: check.statusCode,
+        consecutiveFailures: currentAlert.consecutiveFailures,
+        runtimeStage: runtime.stage,
+        error: e.message,
+      });
     }
 
     shouldPersist = true;
@@ -697,6 +735,34 @@ export default {
       return new Response('User-agent: *\nDisallow: /', {
         headers: { 'Content-Type': 'text/plain' },
       });
+    }
+
+    if (path === '/recovery' || path === '/recovery.json') {
+      try {
+        const recoveryState = await readJsonObject(env, RECOVERY_STATE_KEY, {});
+        const recoveryEvents = await readJsonObject(env, RECOVERY_EVENTS_KEY, {
+          updated: null,
+          events: [],
+        });
+
+        return new Response(JSON.stringify({
+          updated: recoveryEvents.updated || null,
+          state: recoveryState,
+          events: Array.isArray(recoveryEvents.events) ? recoveryEvents.events : [],
+        }, null, 2), {
+          headers: {
+            ...corsHeaders,
+            'Content-Type': 'application/json',
+            'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
+          },
+        });
+      } catch (e) {
+        console.error('Error reading recovery data:', e.message);
+        return new Response(JSON.stringify({ error: 'Failed to read recovery data' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
     }
 
     // Current status
