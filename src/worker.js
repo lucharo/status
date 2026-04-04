@@ -8,6 +8,13 @@ const SERVICES = [
     url: 'https://etymology.luischav.es',
     healthPath: '/health',
     timeoutMs: 15000,
+    recovery: {
+      kind: 'hf-space',
+      spaceId: 'lucharo/etymology',
+      triggerRuntimeStage: 'RUNTIME_ERROR',
+      minConsecutiveFailures: 2,
+      cooldownMs: 60 * 60 * 1000,
+    },
   },
   {
     id: 'tfl',
@@ -24,6 +31,9 @@ const SERVICES = [
     timeoutMs: 10000,
   },
 ];
+
+const HF_API_BASE = 'https://huggingface.co/api/spaces';
+const RECOVERY_STATE_KEY = 'recovery-state.json';
 
 // Parse CSV data into array of objects
 function parseCsv(csvText) {
@@ -78,6 +88,64 @@ function getMonthKeys(startDate, endDate) {
   }
 
   return months;
+}
+
+function parseTimestampMs(value) {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function readJsonObject(env, key, fallback = {}) {
+  try {
+    const obj = await env.STATUS_BUCKET.get(key);
+    if (!obj) return fallback;
+
+    const parsed = await obj.json();
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch (e) {
+    console.error(`Failed to read/parse ${key}:`, e.message);
+  }
+  return fallback;
+}
+
+async function writeJsonObject(env, key, value) {
+  await env.STATUS_BUCKET.put(key, JSON.stringify(value, null, 2), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+}
+
+async function getHfSpaceRuntime(spaceId, token) {
+  const response = await fetch(`${HF_API_BASE}/${spaceId}/runtime`, {
+    headers: {
+      'User-Agent': 'StatusPage/1.0',
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`HF runtime HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function restartHfSpace(spaceId, token) {
+  const response = await fetch(`${HF_API_BASE}/${spaceId}/restart`, {
+    method: 'POST',
+    headers: {
+      'User-Agent': 'StatusPage/1.0',
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`HF restart HTTP ${response.status}`);
+  }
+
+  return response.json();
 }
 
 // Check health of a single service
@@ -370,20 +438,8 @@ async function updateIncidentsJson(env) {
 
 // Update alert state tracking (for future email alerts)
 async function updateAlertState(env, checks) {
-  let alertState = {};
-  try {
-    const existing = await env.STATUS_BUCKET.get('alert-state.json');
-    if (existing) {
-      const parsed = await existing.json();
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        alertState = parsed;
-      }
-    }
-  } catch (e) {
-    console.error('Failed to read/parse alert-state.json, starting fresh:', e.message);
-  }
-
-  let stateChanged = false;
+  const alertState = await readJsonObject(env, 'alert-state.json');
+  let shouldPersist = false;
 
   for (const check of checks) {
     const prev = alertState[check.serviceId] || {
@@ -393,40 +449,141 @@ async function updateAlertState(env, checks) {
     };
 
     if (check.isUp) {
-      if (!prev.isUp) {
-        // Service recovered
-        console.log(`[RECOVERED] ${check.serviceId} is back up`);
-        stateChanged = true;
-      }
-      alertState[check.serviceId] = {
+      const nextState = {
         isUp: true,
         since: prev.isUp ? prev.since : check.timestamp,
         consecutiveFailures: 0,
       };
+
+      if (!prev.isUp) {
+        // Service recovered
+        console.log(`[RECOVERED] ${check.serviceId} is back up`);
+      }
+
+      if (
+        prev.isUp !== nextState.isUp ||
+        prev.since !== nextState.since ||
+        prev.consecutiveFailures !== nextState.consecutiveFailures
+      ) {
+        shouldPersist = true;
+      }
+
+      alertState[check.serviceId] = nextState;
     } else {
       const failures = prev.consecutiveFailures + 1;
+      let nextState;
+
       if (failures >= 2 && prev.isUp) {
         // Service is confirmed down (2 consecutive failures)
         console.log(`[DOWN] ${check.serviceId} is unreachable (status: ${check.statusCode})`);
-        stateChanged = true;
-        alertState[check.serviceId] = {
+        nextState = {
           isUp: false,
           since: check.timestamp,
           consecutiveFailures: failures,
         };
       } else {
-        alertState[check.serviceId] = {
+        nextState = {
           ...prev,
           consecutiveFailures: failures,
         };
       }
+
+      if (
+        prev.isUp !== nextState.isUp ||
+        prev.since !== nextState.since ||
+        prev.consecutiveFailures !== nextState.consecutiveFailures
+      ) {
+        shouldPersist = true;
+      }
+
+      alertState[check.serviceId] = nextState;
     }
   }
 
-  if (stateChanged) {
-    await env.STATUS_BUCKET.put('alert-state.json', JSON.stringify(alertState, null, 2), {
-      httpMetadata: { contentType: 'application/json' },
-    });
+  if (shouldPersist) {
+    await writeJsonObject(env, 'alert-state.json', alertState);
+  }
+
+  return alertState;
+}
+
+async function maybeRecoverServices(env, checks, alertState) {
+  if (!env.HF_TOKEN) return;
+
+  const serviceMap = Object.fromEntries(SERVICES.map(service => [service.id, service]));
+  const recoveryState = await readJsonObject(env, RECOVERY_STATE_KEY);
+  let shouldPersist = false;
+
+  for (const check of checks) {
+    if (check.isUp) continue;
+
+    const service = serviceMap[check.serviceId];
+    const recovery = service?.recovery;
+    const currentAlert = alertState?.[check.serviceId];
+
+    if (!recovery || recovery.kind !== 'hf-space' || !currentAlert) continue;
+    if (currentAlert.isUp || currentAlert.consecutiveFailures < recovery.minConsecutiveFailures) continue;
+
+    const prevRecoveryState =
+      recoveryState[check.serviceId] &&
+      typeof recoveryState[check.serviceId] === 'object' &&
+      !Array.isArray(recoveryState[check.serviceId])
+        ? recoveryState[check.serviceId]
+        : {};
+
+    const lastAttemptMs = parseTimestampMs(prevRecoveryState.lastAttemptAt);
+    if (lastAttemptMs && Date.now() - lastAttemptMs < recovery.cooldownMs) {
+      console.log(`[RECOVERY] Cooldown active for ${check.serviceId}, skipping restart`);
+      continue;
+    }
+
+    let runtime;
+    try {
+      runtime = await getHfSpaceRuntime(recovery.spaceId, env.HF_TOKEN);
+    } catch (e) {
+      console.error(`[RECOVERY] Failed to read HF runtime for ${check.serviceId}:`, e.message);
+      recoveryState[check.serviceId] = {
+        ...prevRecoveryState,
+        lastAttemptAt: check.timestamp,
+        lastError: `runtime check failed: ${e.message}`,
+      };
+      shouldPersist = true;
+      continue;
+    }
+
+    if (runtime.stage !== recovery.triggerRuntimeStage) {
+      console.log(
+        `[RECOVERY] Skipping ${check.serviceId}; HF runtime is ${runtime.stage}, not ${recovery.triggerRuntimeStage}`
+      );
+      continue;
+    }
+
+    try {
+      const restarted = await restartHfSpace(recovery.spaceId, env.HF_TOKEN);
+      console.log(
+        `[RECOVERY] Restarted ${recovery.spaceId} for ${check.serviceId}; ${runtime.stage} -> ${restarted.stage}`
+      );
+      recoveryState[check.serviceId] = {
+        lastAttemptAt: check.timestamp,
+        lastKnownRuntimeStage: runtime.stage,
+        lastRestartStage: restarted.stage,
+        lastError: null,
+      };
+    } catch (e) {
+      console.error(`[RECOVERY] Failed to restart ${recovery.spaceId}:`, e.message);
+      recoveryState[check.serviceId] = {
+        ...prevRecoveryState,
+        lastAttemptAt: check.timestamp,
+        lastKnownRuntimeStage: runtime.stage,
+        lastError: e.message,
+      };
+    }
+
+    shouldPersist = true;
+  }
+
+  if (shouldPersist) {
+    await writeJsonObject(env, RECOVERY_STATE_KEY, recoveryState);
   }
 }
 
@@ -464,7 +621,20 @@ export default {
       console.error('Failed to update daily aggregate:', e.message);
     }
 
-    // Background: pre-compute JSON, update alert state, cleanup old aggregates
+    let alertState = {};
+    try {
+      alertState = await updateAlertState(env, checks);
+    } catch (e) {
+      console.error('Failed to update alert state:', e.message);
+    }
+
+    try {
+      await maybeRecoverServices(env, checks, alertState);
+    } catch (e) {
+      console.error('Failed to run automatic recovery:', e.message);
+    }
+
+    // Background: pre-compute JSON and cleanup old aggregates
     const oldDate = new Date();
     oldDate.setUTCDate(oldDate.getUTCDate() - 91);
     const oldAggregateKey = `aggregates/${oldDate.toISOString().split('T')[0]}.json`;
@@ -476,8 +646,6 @@ export default {
       updateIncidentsJson(env)
         .then(() => console.log('Updated incidents.json'))
         .catch(e => console.error('Failed to update incidents.json:', e.message)),
-      updateAlertState(env, checks)
-        .catch(e => console.error('Failed to update alert state:', e.message)),
       env.STATUS_BUCKET.delete(oldAggregateKey).catch(() => {}),
     ]));
 
