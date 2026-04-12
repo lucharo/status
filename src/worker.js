@@ -11,8 +11,18 @@ const SERVICES = [
     recovery: {
       kind: 'hf-space',
       spaceId: 'lucharo/etymology',
-      triggerStatusCodes: [503],
-      triggerRuntimeStage: 'RUNTIME_ERROR',
+      triggerConditions: [
+        {
+          statusCodes: [503],
+          runtimeStages: ['RUNTIME_ERROR'],
+          requiredMatchedFailures: 2,
+        },
+        {
+          statusCodes: [500],
+          runtimeStages: ['SLEEPING'],
+          requiredMatchedFailures: 3,
+        },
+      ],
       minConsecutiveFailures: 2,
       cooldownMs: 60 * 60 * 1000,
       requestTimeoutMs: 10000,
@@ -131,6 +141,14 @@ async function appendRecoveryEvent(env, event) {
   });
 }
 
+async function appendRecoveryEventSafely(env, event) {
+  try {
+    await appendRecoveryEvent(env, event);
+  } catch (e) {
+    console.error(`[RECOVERY] Failed to persist recovery event for ${event.serviceId}:`, e.message);
+  }
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -145,7 +163,41 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   }
 }
 
+function getDeadline(timeoutMs) {
+  return Date.now() + timeoutMs;
+}
+
+function getRemainingTimeoutMs(deadline) {
+  return Math.max(1, deadline - Date.now());
+}
+
+async function readResponseTextWithTimeout(response, timeoutMs, context) {
+  let timeout;
+
+  try {
+    return await Promise.race([
+      response.text(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${context} timed out while reading response body`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readJsonResponseWithTimeout(response, timeoutMs, context) {
+  const text = await readResponseTextWithTimeout(response, timeoutMs, context);
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${context} returned invalid JSON: ${e.message}`);
+  }
+}
+
 async function getHfSpaceRuntime(spaceId, token, timeoutMs) {
+  const deadline = getDeadline(timeoutMs);
   const response = await fetchWithTimeout(
     `${HF_API_BASE}/${spaceId}/runtime`,
     {
@@ -154,17 +206,18 @@ async function getHfSpaceRuntime(spaceId, token, timeoutMs) {
         Authorization: `Bearer ${token}`,
       },
     },
-    timeoutMs
+    getRemainingTimeoutMs(deadline)
   );
 
   if (!response.ok) {
     throw new Error(`HF runtime HTTP ${response.status}`);
   }
 
-  return response.json();
+  return readJsonResponseWithTimeout(response, getRemainingTimeoutMs(deadline), 'HF runtime');
 }
 
 async function restartHfSpace(spaceId, token, timeoutMs) {
+  const deadline = getDeadline(timeoutMs);
   const response = await fetchWithTimeout(
     `${HF_API_BASE}/${spaceId}/restart`,
     {
@@ -174,14 +227,50 @@ async function restartHfSpace(spaceId, token, timeoutMs) {
         Authorization: `Bearer ${token}`,
       },
     },
-    timeoutMs
+    getRemainingTimeoutMs(deadline)
   );
 
   if (!response.ok) {
     throw new Error(`HF restart HTTP ${response.status}`);
   }
 
-  return response.json();
+  return readJsonResponseWithTimeout(response, getRemainingTimeoutMs(deadline), 'HF restart');
+}
+
+function findMatchingRecoveryTrigger(recovery, statusCode, runtimeStage) {
+  if (Array.isArray(recovery.triggerConditions) && recovery.triggerConditions.length > 0) {
+    return recovery.triggerConditions.find(condition => {
+      const statusMatches = !condition.statusCodes || condition.statusCodes.includes(statusCode);
+      const runtimeMatches = !condition.runtimeStages || condition.runtimeStages.includes(runtimeStage);
+      return statusMatches && runtimeMatches;
+    }) || null;
+  }
+
+  const statusMatches = !recovery.triggerStatusCodes || recovery.triggerStatusCodes.includes(statusCode);
+  const runtimeStages = recovery.triggerRuntimeStages || (recovery.triggerRuntimeStage ? [recovery.triggerRuntimeStage] : []);
+  const runtimeMatches = runtimeStages.length === 0 || runtimeStages.includes(runtimeStage);
+
+  if (!statusMatches || !runtimeMatches) {
+    return null;
+  }
+
+  return {
+    requiredMatchedFailures: recovery.minConsecutiveFailures,
+  };
+}
+
+function clearRecoveryTriggerTracking(state) {
+  const {
+    lastMatchedTriggerKey,
+    matchedTriggerFailures,
+    ...rest
+  } = state || {};
+
+  return rest;
+}
+
+function hasRecoveryTriggerTracking(state) {
+  return Boolean(state?.lastMatchedTriggerKey) || Number.isFinite(state?.matchedTriggerFailures);
 }
 
 // Check health of a single service
@@ -551,15 +640,9 @@ async function maybeRecoverServices(env, checks, alertState) {
   let shouldPersist = false;
 
   for (const check of checks) {
-    if (check.isUp) continue;
-
     const service = serviceMap[check.serviceId];
     const recovery = service?.recovery;
-    const currentAlert = alertState?.[check.serviceId];
-
-    if (!recovery || recovery.kind !== 'hf-space' || !currentAlert) continue;
-    if (currentAlert.isUp || currentAlert.consecutiveFailures < recovery.minConsecutiveFailures) continue;
-    if (recovery.triggerStatusCodes && !recovery.triggerStatusCodes.includes(check.statusCode)) continue;
+    if (!recovery || recovery.kind !== 'hf-space') continue;
 
     const prevRecoveryState =
       recoveryState[check.serviceId] &&
@@ -567,6 +650,23 @@ async function maybeRecoverServices(env, checks, alertState) {
       !Array.isArray(recoveryState[check.serviceId])
         ? recoveryState[check.serviceId]
         : {};
+
+    if (check.isUp) {
+      if (hasRecoveryTriggerTracking(prevRecoveryState)) {
+        recoveryState[check.serviceId] = clearRecoveryTriggerTracking(prevRecoveryState);
+        shouldPersist = true;
+      }
+      continue;
+    }
+
+    const currentAlert = alertState?.[check.serviceId];
+    if (!currentAlert || currentAlert.isUp || currentAlert.consecutiveFailures < recovery.minConsecutiveFailures) {
+      if (hasRecoveryTriggerTracking(prevRecoveryState)) {
+        recoveryState[check.serviceId] = clearRecoveryTriggerTracking(prevRecoveryState);
+        shouldPersist = true;
+      }
+      continue;
+    }
 
     const lastAttemptMs = parseTimestampMs(prevRecoveryState.lastAttemptAt);
     if (lastAttemptMs && Date.now() - lastAttemptMs < recovery.cooldownMs) {
@@ -580,11 +680,12 @@ async function maybeRecoverServices(env, checks, alertState) {
     } catch (e) {
       console.error(`[RECOVERY] Failed to read HF runtime for ${check.serviceId}:`, e.message);
       recoveryState[check.serviceId] = {
-        ...prevRecoveryState,
+        ...clearRecoveryTriggerTracking(prevRecoveryState),
         lastProbeFailureAt: check.timestamp,
         lastError: `runtime check failed: ${e.message}`,
       };
-      await appendRecoveryEvent(env, {
+      shouldPersist = true;
+      await appendRecoveryEventSafely(env, {
         timestamp: check.timestamp,
         serviceId: check.serviceId,
         action: 'runtime_probe_failed',
@@ -592,14 +693,35 @@ async function maybeRecoverServices(env, checks, alertState) {
         consecutiveFailures: currentAlert.consecutiveFailures,
         error: e.message,
       });
-      shouldPersist = true;
       continue;
     }
 
-    if (runtime.stage !== recovery.triggerRuntimeStage) {
+    const matchedTrigger = findMatchingRecoveryTrigger(recovery, check.statusCode, runtime.stage);
+    if (!matchedTrigger) {
+      if (hasRecoveryTriggerTracking(prevRecoveryState)) {
+        recoveryState[check.serviceId] = clearRecoveryTriggerTracking(prevRecoveryState);
+        shouldPersist = true;
+      }
       console.log(
-        `[RECOVERY] Skipping ${check.serviceId}; HF runtime is ${runtime.stage}, not ${recovery.triggerRuntimeStage}`
+        `[RECOVERY] Skipping ${check.serviceId}; status ${check.statusCode} and HF runtime ${runtime.stage} do not match a restart trigger`
       );
+      continue;
+    }
+
+    const triggerKey = `${check.statusCode}:${runtime.stage}`;
+    const matchedTriggerFailures = prevRecoveryState.lastMatchedTriggerKey === triggerKey
+      ? (prevRecoveryState.matchedTriggerFailures || 0) + 1
+      : 1;
+    const requiredMatchedFailures = matchedTrigger.requiredMatchedFailures || recovery.minConsecutiveFailures;
+
+    if (matchedTriggerFailures < requiredMatchedFailures) {
+      recoveryState[check.serviceId] = {
+        ...clearRecoveryTriggerTracking(prevRecoveryState),
+        lastMatchedTriggerKey: triggerKey,
+        matchedTriggerFailures,
+        lastKnownRuntimeStage: runtime.stage,
+      };
+      shouldPersist = true;
       continue;
     }
 
@@ -609,12 +731,14 @@ async function maybeRecoverServices(env, checks, alertState) {
         `[RECOVERY] Restarted ${recovery.spaceId} for ${check.serviceId}; ${runtime.stage} -> ${restarted.stage}`
       );
       recoveryState[check.serviceId] = {
+        ...clearRecoveryTriggerTracking(prevRecoveryState),
         lastAttemptAt: check.timestamp,
         lastKnownRuntimeStage: runtime.stage,
         lastRestartStage: restarted.stage,
         lastError: null,
       };
-      await appendRecoveryEvent(env, {
+      shouldPersist = true;
+      await appendRecoveryEventSafely(env, {
         timestamp: check.timestamp,
         serviceId: check.serviceId,
         action: 'restart_succeeded',
@@ -626,12 +750,13 @@ async function maybeRecoverServices(env, checks, alertState) {
     } catch (e) {
       console.error(`[RECOVERY] Failed to restart ${recovery.spaceId}:`, e.message);
       recoveryState[check.serviceId] = {
-        ...prevRecoveryState,
+        ...clearRecoveryTriggerTracking(prevRecoveryState),
         lastAttemptAt: check.timestamp,
         lastKnownRuntimeStage: runtime.stage,
         lastError: e.message,
       };
-      await appendRecoveryEvent(env, {
+      shouldPersist = true;
+      await appendRecoveryEventSafely(env, {
         timestamp: check.timestamp,
         serviceId: check.serviceId,
         action: 'restart_failed',
@@ -641,8 +766,6 @@ async function maybeRecoverServices(env, checks, alertState) {
         error: e.message,
       });
     }
-
-    shouldPersist = true;
   }
 
   if (shouldPersist) {
